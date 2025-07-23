@@ -1,0 +1,138 @@
+pipeline {
+    agent any
+
+    environment {
+        DOCKER_HUB_USERNAME = "maazmohemmed"
+        APP_NAME = "amazon-prime-video"
+
+        K8S_DEPLOYMENT_NAME = "amazon-prime-video-deployment"
+        K8S_SERVICE_NAME = "amazon-prime-video-service"
+        K8S_MANIFEST_FILE = "kubernetes/manifest.yml"
+
+        // *** KUBECONFIG_PATH must point to the actual path where minikube created the config
+        KUBECONFIG_PATH = "/home/maaz/.kube/config" // CONFIRMED PATH
+    }
+
+    stages {
+        stage('Checkout Source Code') {
+            steps {
+                git branch: 'main', credentialsId: 'github-credentials', url: 'https://github.com/maazmohemmed/amazon-prime-video-kubernetes.git'
+            }
+        }
+
+        stage('Install Application Dependencies & Build') {
+            steps {
+                sh 'npm install'
+                sh 'npm run build'
+            }
+        }
+
+        stage('Run Trivy Scan (Filesystem)') {
+            steps {
+                sh 'trivy fs --severity HIGH,CRITICAL . || true'
+            }
+        }
+
+        stage('Docker Login & Build Image') {
+            steps {
+                script {
+                    withCredentials([usernamePassword(credentialsId: 'ae798623-fda7-4c12-9b30-89db69efe0e7', passwordVariable: 'DOCKER_PASSWORD', usernameVariable: 'DOCKER_USERNAME')]) {
+                        sh "echo \"$DOCKER_PASSWORD\" | docker login -u \"$DOCKER_USERNAME\" --password-stdin"
+                    }
+                    sh "docker build -t ${DOCKER_HUB_USERNAME}/${APP_NAME}:latest ."
+                }
+            }
+        }
+
+        stage('Run Docker Scout Scan (Image)') {
+            steps {
+                echo "Skipping Docker Scout for this local deployment. Consider alternative image scanners."
+            }
+        }
+
+        stage('Push Image to Docker Hub') {
+            steps {
+                script {
+                    sh "docker push ${DOCKER_HUB_USERNAME}/${APP_NAME}:latest"
+                    echo "Image pushed to Docker Hub: ${DOCKER_HUB_USERNAME}/${APP_NAME}:latest"
+                }
+            }
+        }
+
+        stage('Deploy to Minikube Kubernetes') {
+            steps {
+                script {
+                    // This is where KUBECONFIG is applied
+                    withEnv(["KUBECONFIG=${KUBECONFIG_PATH}"]) {
+                        // --- REMOVED DEBUGGING STEPS for conciseness once the fix is applied ---
+                        // Re-add them temporarily if you still face issues
+                        // sh 'echo "Jenkins user: $(whoami)"'
+                        // sh 'echo "Current KUBECONFIG environment variable in pipeline: $KUBECONFIG"'
+                        // sh 'ls -ld /home/maaz/.kube'
+                        // sh 'ls -l /home/maaz/.kube/config'
+                        // sh "cat ${KUBECONFIG_PATH} || echo 'Failed to read kubeconfig directly.'"
+
+                        sh """
+                            # Replace the image name in the manifest
+                            # Corrected sed: APP_NAME is usually the image name when building locally for the initial image line
+                            sed -i 's|image: ${APP_NAME}:latest|image: ${DOCKER_HUB_USERNAME}/${APP_NAME}:latest|g' ${K8S_MANIFEST_FILE}
+
+                            # Ensure imagePullPolicy: Always is present
+                            if ! grep -q "imagePullPolicy" ${K8S_MANIFEST_FILE}; then
+                                # Add imagePullPolicy if not present below the image line
+                                sed -i '/image: ${DOCKER_HUB_USERNAME}\\/${APP_NAME}:latest/a\\            imagePullPolicy: Always' ${K8S_MANIFEST_FILE}
+                            else
+                                # Modify existing imagePullPolicy to Always
+                                sed -i 's/imagePullPolicy: .*/imagePullPolicy: Always/g' ${K8S_MANIFEST_FILE}
+                            fi
+                        """
+                        echo "manifest.yml modified to pull from Docker Hub and set imagePullPolicy: Always."
+
+                        // All kubectl commands here will now use the KUBECONFIG_PATH
+                        // and leverage the minikube kubectl wrapper
+                        sh "minikube kubectl -- apply -f ${K8S_MANIFEST_FILE}"
+
+                        echo "Deployment and Service applied to Minikube."
+                        echo "Waiting for pods to be ready..."
+                        sh "minikube kubectl -- rollout status deployment/${K8S_DEPLOYMENT_NAME} --timeout=300s"
+                    }
+                }
+            }
+        }
+
+        stage('Get Application URL') {
+            steps { 
+                script {
+                    withEnv([
+                        "KUBECONFIG=${KUBECONFIG_PATH}", // Still needed for kubectl commands
+                        "MINIKUBE_HOME=/home/maaz"      // Tells minikube where to find its .minikube directory
+                        ]) {
+                        sh "minikube --profile minikube service ${K8S_SERVICE_NAME} --url"
+                    }
+                    echo "Application URL command executed. Check logs for URL."
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                sh """
+                    # Revert image name in the manifest
+                    sed -i 's|image: ${DOCKER_HUB_USERNAME}\\/${APP_NAME}:latest|image: ${APP_NAME}:latest|g' ${K8S_MANIFEST_FILE}
+                    # Revert imagePullPolicy to IfNotPresent (or original, if known)
+                    sed -i 's/imagePullPolicy: Always/imagePullPolicy: IfNotPresent/g' ${K8S_MANIFEST_FILE}
+                """
+                echo "manifest.yml reverted to local image and pull policy."
+            }
+            echo "Pipeline finished."
+        }
+        success {
+            echo "Deployment successful! Check the URL in the console output from 'Get Application URL' stage. 🎉"
+        }
+        failure {
+            echo "Deployment failed. Review the console output for errors. 😔"
+        }
+    }
+}
