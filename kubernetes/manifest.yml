@@ -17,7 +17,8 @@ spec:
     spec:
       containers:
       - name: amazon-prime-video-container
-        image: pseendrupu/amazon-prime-video
+        image: pseendrupu/amazon-prime-video:latest
+        imagePullPolicy: Always
         ports:
         - containerPort: 3000
 ---
