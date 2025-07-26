@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
       - name: amazon-prime-video-container
-        image: maazmohemmed/amazon-prime-video
+        image: pseendrupu/amazon-prime-video
         ports:
         - containerPort: 3000
 ---
